@@ -7,6 +7,10 @@
 
 [Chiron][chiron] is a library for working with JSON for F#, similar to the Haskell Aeson package. See the dedicated [Chiron Site][chiron] for more information.
 
+## Differences in this Branch
+
+This branch removes the dependency on FParsec, using instead a short hand-rolled parser.
+
 ## Installation
 
 Chiron can be installed from [NuGet](https://www.nuget.org/packages/chiron "Chiron on NuGet"). Using the Package Manager Console:

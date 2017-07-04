@@ -4,7 +4,6 @@ open System
 open System.Globalization
 open System.Text
 open Aether
-open FParsec
 
 (* RFC 7159
 
@@ -337,48 +336,6 @@ module Optics =
 [<RequireQualifiedAccess>]
 module internal Escaping =
 
-    let private digit i =
-            (i >= 0x30 && i <= 0x39)
-
-    let private hexdig i =
-            (digit i)
-         || (i >= 0x41 && i <= 0x46)
-         || (i >= 0x61 && i <= 0x66)
-
-    let private unescaped i =
-            i >= 0x20 && i <= 0x21
-         || i >= 0x23 && i <= 0x5b
-         || i >= 0x5d && i <= 0x10ffff
-
-    let private unescapedP =
-        satisfy (int >> unescaped)
-
-    let private hexdig4P =
-        manyMinMaxSatisfy 4 4 (int >> hexdig)
-        |>> fun s ->
-            char (Int32.Parse (s, NumberStyles.HexNumber))
-
-    let private escapedP =
-            skipChar '\\'
-        >>. choice [
-                pchar '"'
-                pchar '\\'
-                pchar '/'
-                skipChar 'b' >>% '\u0008'
-                skipChar 'f' >>% '\u000c'
-                skipChar 'n' >>% '\u000a'
-                skipChar 'r' >>% '\u000d'
-                skipChar 't' >>% '\u0009'
-                skipChar 'u' >>. hexdig4P ]
-
-    let private charP =
-        choice [
-            unescapedP
-            escapedP ]
-
-    let parse =
-        many charP
-
     let private escapeChars =
         [| '"'; '\\'; '\n'; '\r'; '\t'; '\b'; '\f'
            '\u0000'; '\u0001'; '\u0002'; '\u0003'
@@ -452,163 +409,99 @@ module internal Escaping =
 [<AutoOpen>]
 module Parsing =
 
-    (* Helpers
+    let parse (s:string) =
+        let index = ref 0
+        let numIntroChars = "-0123456789."
+        let numChars = "-0123456789.eE"
+        let len = s.Length
+        let inline error s =
+            invalidOp s
+        let skipWhiteSpace () =
+            while !index < len && System.Char.IsWhiteSpace(s.[!index]) do incr index
+        let rec parseValue () =
+            skipWhiteSpace ()
+            if !index < len then
+                let c = s.[!index]
+                if c = '[' then parseArray ()
+                elif c = '{' then parseObject ()
+                elif c = '"' then parseString ()
+                elif numIntroChars.IndexOf(c) <> -1 then parseNumber ()
+                elif c = 't' then parseLiteral("true",Bool true)
+                elif c = 'f' then parseLiteral("false",Bool false)
+                elif c = 'n' then parseLiteral("null",Null ())
+                else error (sprintf "Unexpected tokens %s" (s.Substring(!index)))
+            else Null ()
+        and parseLiteral (text,value) =
+            let found = s.Substring(!index, text.Length)
+            if found = text 
+            then
+                index := !index + text.Length
+                value
+            else error (sprintf "Invalid token, expecting %s but found %s" text found)
+        and parseObject () =
+            incr index
+            skipWhiteSpace ()
+            if s.[!index] = '}' then incr index; Object (Map.empty)
+            else
+                let pairs = parsePairs ()
+                if s.[!index] <> '}' then error "Expecting , or }"
+                incr index
+                pairs |> Map.ofList |> Object
+        and parsePairs () =
+            let name = 
+                match parseValue () with
+                | String s -> s
+                | _ -> error "Expecting property name"
+            skipWhiteSpace ()
+            if s.[!index] <> ':' then error "Expecting :"
+            incr index
+            let value = parseValue ()
+            let pair = (name,value)
+            skipWhiteSpace ()
+            if s.[!index] = ',' then
+                incr index
+                skipWhiteSpace ()
+                pair::parsePairs ()
+            else [pair]
+        and parseArray () =
+            incr index
+            skipWhiteSpace ()
+            if  s.[!index] = ']' then incr index; Array []
+            else          
+               let xs = parseValues ()
+               if s.[!index] <> ']' then error (sprintf "Expecting , or ] but found '%c' at %d" s.[!index] !index) 
+               incr index
+               Array xs
+        and parseValues () =
+            let x = parseValue ()
+            skipWhiteSpace ()
+            if s.[!index] = ',' then 
+               incr index
+               skipWhiteSpace ()
+               x::parseValues ()
+            else [x]
+        and parseString () =
+            incr index
+            let startIndex = !index
+            let mutable c = ' '
+            let mutable isEscaped = false
+            while (c <- s.[!index]; c <> '\"') do 
+                if c = '\\' then isEscaped <- true; incr index
+                incr index
+            let text = s.Substring(startIndex, !index-startIndex)
+            if !index < len then incr index
+            if isEscaped then String (System.Text.RegularExpressions.Regex.Unescape text)
+            else String text
+        and parseNumber () =
+            let startIndex = !index
+            while !index < len && numChars.IndexOf(s.[!index]) <> -1 do incr index
+            let n = System.Decimal.Parse(s.Substring(startIndex, !index-startIndex))
+            Number n
+        let value = parseValue ()
+        skipWhiteSpace ()
+        if !index < len then error (sprintf "Unexpected tokens %s" (s.Substring(!index)))
+        value
 
-       Utlility functions for working with intermediate states of
-       parsers, minimizing boilerplate and unpleasant code. *)
-
-    let private emp =
-        function | Some x -> x
-                 | _ -> ""
-
-    (* Grammar
-
-       Common grammatical elements forming parts of other parsers as
-       as defined in RFC 1759. The elements are implemented slightly
-       differently due to the design of parser combinators used, chiefly
-       concerning whitespace, which is always implemented as trailing.
-
-       Taken from RFC 7159, Section 2 Grammar
-       See [http://tools.ietf.org/html/rfc7159#section-2] *)
-
-    let private wsp i =
-            i = 0x20
-         || i = 0x09
-         || i = 0x0a
-         || i = 0x0d
-
-    let private wspP =
-        skipManySatisfy (int >> wsp)
-
-    let private charWspP c =
-        skipChar c .>> wspP
-
-    let private beginArrayP =
-        charWspP '['
-
-    let private beginObjectP =
-        charWspP '{'
-
-    let private endArrayP =
-        charWspP ']'
-
-    let private endObjectP =
-        charWspP '}'
-
-    let private nameSeparatorP =
-        charWspP ':'
-
-    let private valueSeparatorP =
-        charWspP ','
-
-    (* JSON
-
-       As the JSON grammar is recursive in various forms, we create a
-       reference parser which will be assigned later, allowing for recursive
-       definition of parsing rules. *)
-
-    let private jsonP, jsonR =
-        createParserForwardedToRef ()
-
-    (* Values
-
-       Taken from RFC 7159, Section 3 Values
-       See [http://tools.ietf.org/html/rfc7159#section-3] *)
-
-    let private boolP =
-            stringReturn "true" true
-        <|> stringReturn "false" false
-        .>> wspP
-
-    let private nullP =
-        stringReturn "null" () .>> wspP
-
-    (* Numbers
-
-       The numbers parser is implemented by parsing the JSON number value
-       in to a known representation valid as string under Double.Parse
-       natively (invoked as the float conversion function on the eventual
-       string).
-
-       Taken from RFC 7159, Section 6 Numbers
-       See [http://tools.ietf.org/html/rfc7159#section-6] *)
-
-    let private digit1to9 i =
-            i >= 0x31 && i <= 0x39
-
-    let private digit i =
-            digit1to9 i
-         || i = 0x30
-
-    let private e i =
-            i = 0x45 
-         || i = 0x65
-
-    let private minusP =
-        charReturn '-' "-"
-
-    let private intP =
-        charReturn '0' "0" <|> (satisfy (int >> digit1to9) .>>. manySatisfy (int >> digit)
-        |>> fun (h, t) -> string h + t)
-
-    let private fracP =
-        skipChar '.' >>.  many1Satisfy (int >> digit)
-        |>> fun i -> "." + i
-
-    let private expP =
-            skipSatisfy (int >> e)
-        >>. opt (charReturn '-' "-" <|> charReturn '+' "+")
-        .>>. many1Satisfy (int >> digit)
-        |>> function | Some s, d -> "e" + s + d
-                     | _, d -> "e" + d
-
-    let private numberP =
-        pipe4 (opt minusP) intP (opt fracP) (opt expP) (fun m i f e ->
-            decimal (emp m + i + emp f + emp e)) .>> wspP
-
-    (* Strings
-
-       Taken from RFC 7159, Section 7 Strings
-       See [http://tools.ietf.org/html/rfc7159#section-7] *)
-
-    let private quotationMarkP =
-        skipChar '"'
-
-    let private stringP =
-        between quotationMarkP quotationMarkP Escaping.parse .>> wspP
-        |>> fun cs -> new string (List.toArray cs)
-
-    (* Objects
-
-       Taken from RFC 7159, Section 4 Objects
-       See [http://tools.ietf.org/html/rfc7159#section-4] *)
-
-    let private memberP =
-        stringP .>> nameSeparatorP .>>. jsonP
-
-    let private objectP =
-        between beginObjectP endObjectP (sepBy memberP valueSeparatorP)
-        |>> Map.ofList
-
-    (* Arrays
-
-       Taken from RFC 7159, Section 5 Arrays
-       See [http://tools.ietf.org/html/rfc7159#section-5] *)
-
-    let private arrayP =
-        between beginArrayP endArrayP (sepBy jsonP valueSeparatorP)
-
-    (* JSON *)
-
-    do jsonR :=
-            wspP
-        >>. choice [
-                arrayP  |>> Array
-                boolP   |>> Bool
-                nullP   |>> Null
-                numberP |>> Number
-                objectP |>> Object
-                stringP |>> String ]
 
     (* Functions
 
@@ -619,29 +512,13 @@ module Parsing =
     [<RequireQualifiedAccess>]
     module Json =
 
-        let internal parseJson s =
-            if String.IsNullOrWhiteSpace s then
-                Error "Input is null or whitespace"
-            else
-                match run jsonP s with
-                | Success (json, _, _) -> Value json
-                | Failure (e, _, _) -> Error e
+        let tryParse s =
+            if System.String.IsNullOrWhiteSpace s then Choice2Of2 "Input is null or whitespace"
+            else 
+                try parse s |> Choice1Of2
+                with e -> Choice2Of2(e.Message)
 
-        let tryParse =
-               parseJson
-            >> function | Value json -> Choice1Of2 json
-                        | Error e -> Choice2Of2 e
-
-        let parse =
-               parseJson
-            >> function | Value json -> json
-                        | Error e -> failwith e
-
-        let import s =
-            fun json ->
-                match parseJson s with
-                | Value json -> Value (), json
-                | Error e -> Error e, json
+        let parse = parse
 
 (* Formatting *)
 
